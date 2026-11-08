@@ -234,3 +234,9 @@ select v.name, v.category, v.unit from (values
   ('Ice','Cooking','bag')
 ) as v(name, category, unit)
 where not exists (select 1 from public.inventory_items);
+
+-- ========== Lock down helper functions ==========
+alter function public.touch_updated_at() set search_path = public;
+revoke execute on function public.handle_new_user(), public.profiles_guard(), public.shifts_guard(), public.touch_updated_at() from public, anon, authenticated;
+revoke execute on function public.is_admin(), public.is_worker() from public, anon;
+grant execute on function public.is_admin(), public.is_worker() to authenticated;
