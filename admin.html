@@ -1,0 +1,461 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#ffffff">
+<meta name="robots" content="noindex">
+<title>Didi's Dogs Admin</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="config.js"></script>
+<script src="common.js"></script>
+<script>
+(() => {
+  const { sb, esc, money, num, today, fmtDate, fmtTime, calcHours, toast, sheet, friendlyError } = DD;
+  const app = document.getElementById("app");
+  const CATS = ["Meat","Buns","Toppings","Sauces","Sides","Seasonings","Drinks","Cooking","Serving","Cleaning","Event","Other"];
+
+  const S = { me: null, tab: "inv", items: [], shifts: [], people: [], cat: "All", q: "", hoursFilter: "unpaid" };
+
+  const icons = {
+    inv: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 7l9-4 9 4-9 4-9-4z"/><path d="M3 7v10l9 4 9-4V7"/><path d="M12 11v10"/></svg>',
+    buy: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M6 6h15l-1.5 9h-12z"/><path d="M6 6L5 3H2"/><circle cx="9" cy="20" r="1.4"/><circle cx="18" cy="20" r="1.4"/></svg>',
+    hours: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>',
+    team: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20c.8-3.5 3.4-5.5 6.5-5.5s5.7 2 6.5 5.5"/><path d="M16 4.5a3.5 3.5 0 010 7"/><path d="M18 14.7c2 .7 3.2 2.5 3.6 5.3"/></svg>'
+  };
+
+  const needsBuying = (i) => i.on_list || (Number(i.low_at) > 0 && Number(i.qty) <= Number(i.low_at));
+  const isLow = (i) => Number(i.low_at) > 0 && Number(i.qty) <= Number(i.low_at);
+  const personName = (id) => (S.people.find((p) => p.id === id) || {}).name || "Unknown";
+  const crewLink = () => new URL("crew.html", location.href).href;
+
+  // ---------- start ----------
+  async function start() {
+    if (!DD.ready) return DD.notConnected(app);
+    const { data: { session } } = await sb.auth.getSession();
+    if (!session) {
+      return DD.authScreen(app, { title: "Admin", note: "Owner sign in. Workers use the crew page.", onDone: start });
+    }
+    try { S.me = await DD.loadMe(); } catch (e) { return toast(friendlyError(e)); }
+    if (!S.me || S.me.role !== "admin") {
+      app.innerHTML = `<div class="center-box"><div class="brand" style="font-size:22px">Didi's Dogs</div>
+        <p class="sub" style="margin-top:12px">This page is for the owner only. Workers log hours on the crew page.</p>
+        <a class="btn full" href="crew.html">Go to crew page</a>
+        <div style="height:8px"></div><button class="btn light full" id="out">Sign out</button></div>`;
+      app.querySelector("#out").onclick = signOut;
+      return;
+    }
+    await loadAll();
+    render();
+  }
+
+  async function signOut() { await sb.auth.signOut(); S.me = null; start(); }
+
+  async function loadAll() {
+    const [a, b, c] = await Promise.all([
+      sb.from("inventory_items").select("*").order("category").order("name"),
+      sb.from("shifts").select("*").order("work_date", { ascending: false }).order("start_time", { ascending: false }),
+      sb.from("profiles").select("*").order("name")
+    ]);
+    const err = a.error || b.error || c.error;
+    if (err) toast(friendlyError(err));
+    S.items = a.data || []; S.shifts = b.data || []; S.people = c.data || [];
+  }
+
+  // ---------- shell ----------
+  function render() {
+    const buyCount = S.items.filter(needsBuying).length;
+    const pendCount = S.people.filter((p) => p.role === "pending").length;
+    const tabs = [["inv","Inventory"],["buy","Buy Soon"],["hours","Hours"],["team","Workers"]];
+    app.innerHTML = `
+      <header class="top"><div class="wrap">
+        <div class="brand">Didi's Dogs<small>Admin</small></div>
+        <button class="link" id="out">Sign out</button>
+      </div></header>
+      <main class="wrap" id="view"></main>
+      <nav class="tabs"><div class="wrap">
+        ${tabs.map(([k, l]) => `<button data-tab="${k}" class="${S.tab === k ? "on" : ""}">${icons[k]}${l}
+          ${k === "buy" && buyCount ? `<span class="dot">${buyCount}</span>` : ""}
+          ${k === "team" && pendCount ? `<span class="dot">${pendCount}</span>` : ""}</button>`).join("")}
+      </div></nav>`;
+    app.querySelector("#out").onclick = signOut;
+    app.querySelectorAll("[data-tab]").forEach((b) => (b.onclick = () => { S.tab = b.dataset.tab; render(); window.scrollTo(0, 0); }));
+    ({ inv: viewInventory, buy: viewBuy, hours: viewHours, team: viewTeam })[S.tab]();
+  }
+  const view = () => document.getElementById("view");
+
+  // ---------- inventory ----------
+  function viewInventory() {
+    const cats = ["All", ...CATS.filter((c) => S.items.some((i) => i.category === c)),
+      ...[...new Set(S.items.map((i) => i.category))].filter((c) => !CATS.includes(c))];
+    const q = S.q.toLowerCase();
+    const shown = S.items.filter((i) => (S.cat === "All" || i.category === S.cat) && (!q || i.name.toLowerCase().includes(q)));
+    const groups = {};
+    shown.forEach((i) => (groups[i.category] = groups[i.category] || []).push(i));
+    const order = Object.keys(groups).sort((a, b) => (CATS.indexOf(a) + 99) % 99 - (CATS.indexOf(b) + 99) % 99 || a.localeCompare(b));
+
+    view().innerHTML = `
+      <h1>Inventory</h1>
+      <p class="sub">${S.items.length} items · tap − / + to update counts</p>
+      <input id="q" type="search" placeholder="Search items" value="${esc(S.q)}">
+      <div class="chips" style="margin-top:10px">${cats.map((c) => `<button class="chip ${S.cat === c ? "on" : ""}" data-cat="${esc(c)}">${esc(c)}</button>`).join("")}</div>
+      ${shown.length ? order.map((c) => `
+        <h2>${esc(c)}</h2>
+        <div class="list">${groups[c].map(itemRow).join("")}</div>`).join("")
+        : `<div class="empty" style="margin-top:12px">${S.items.length ? "Nothing matches." : "No items yet. Tap + Add item."}</div>`}
+      <button class="btn fab" id="add">+ Add item</button>`;
+
+    const qEl = view().querySelector("#q");
+    qEl.oninput = () => { S.q = qEl.value; const pos = qEl.selectionStart; viewInventory(); const n = view().querySelector("#q"); n.focus(); n.setSelectionRange(pos, pos); };
+    view().querySelectorAll("[data-cat]").forEach((b) => (b.onclick = () => { S.cat = b.dataset.cat; viewInventory(); }));
+    view().querySelector("#add").onclick = () => editItem(null);
+    bindItemRows(view());
+  }
+
+  function itemRow(i) {
+    return `<div class="item" data-id="${i.id}">
+      <button class="tap grow" data-edit="${i.id}">
+        <div class="name">${esc(i.name)}</div>
+        <div class="meta">${i.unit ? esc(i.unit) : "no unit"}${Number(i.low_at) > 0 ? ` · low at ${num(i.low_at)}` : ""}
+          ${isLow(i) ? ` <span class="tag low">Low</span>` : ""}${i.on_list ? ` <span class="tag list">On list</span>` : ""}</div>
+      </button>
+      <div class="stepper"><button data-step="-1" aria-label="Less">−</button><span>${num(i.qty)}</span><button data-step="1" aria-label="More">+</button></div>
+    </div>`;
+  }
+
+  function bindItemRows(root) {
+    root.querySelectorAll("[data-edit]").forEach((b) => (b.onclick = () => editItem(S.items.find((i) => i.id == b.dataset.edit))));
+    root.querySelectorAll("[data-step]").forEach((b) => (b.onclick = async () => {
+      const id = b.closest(".item").dataset.id;
+      const it = S.items.find((i) => i.id == id);
+      const next = Math.max(0, Number(it.qty) + Number(b.dataset.step));
+      if (next === Number(it.qty)) return;
+      const prev = it.qty;
+      it.qty = next;
+      b.parentElement.querySelector("span").textContent = num(next);
+      const { error } = await sb.from("inventory_items").update({ qty: next }).eq("id", id);
+      if (error) { it.qty = prev; toast(friendlyError(error)); }
+      render();
+    }));
+  }
+
+  function editItem(it) {
+    const isNew = !it;
+    it = it || { name: "", category: S.cat !== "All" ? S.cat : "Meat", unit: "", qty: 0, low_at: 0, on_list: false, notes: "" };
+    const catOpts = [...new Set([...CATS, it.category])];
+    sheet(`
+      <h3>${isNew ? "Add item" : "Edit item"}</h3>
+      <label>Name</label><input id="fName" value="${esc(it.name)}" placeholder="e.g. Hot dog buns">
+      <div class="row">
+        <div class="grow"><label>Category</label><select id="fCat">${catOpts.map((c) => `<option ${c === it.category ? "selected" : ""}>${esc(c)}</option>`).join("")}</select></div>
+        <div class="grow"><label>Unit</label><input id="fUnit" value="${esc(it.unit)}" placeholder="pack, case, lb"></div>
+      </div>
+      <div class="row">
+        <div class="grow"><label>How many now</label><input id="fQty" type="number" inputmode="decimal" min="0" step="any" value="${num(it.qty)}"></div>
+        <div class="grow"><label>Running low at</label><input id="fLow" type="number" inputmode="decimal" min="0" step="any" value="${num(it.low_at)}"></div>
+      </div>
+      <p class="muted small" style="margin:6px 0 0">When the count hits "running low at," it shows up on Buy Soon. Leave 0 to turn that off.</p>
+      <div class="switch"><span>Add to Buy Soon anyway</span><input id="fList" type="checkbox" ${it.on_list ? "checked" : ""}></div>
+      <label>Notes</label><textarea id="fNotes" rows="2" placeholder="Brand, where to buy…">${esc(it.notes || "")}</textarea>
+      <div class="actions">
+        ${isNew ? "" : `<button class="btn danger" id="del">Delete</button>`}
+        <button class="btn" id="save">Save</button>
+      </div>`, (el, close) => {
+      if (isNew) el.querySelector("#fName").focus();
+      el.querySelector("#save").onclick = async () => {
+        const row = {
+          name: el.querySelector("#fName").value.trim(),
+          category: el.querySelector("#fCat").value,
+          unit: el.querySelector("#fUnit").value.trim(),
+          qty: Math.max(0, Number(el.querySelector("#fQty").value) || 0),
+          low_at: Math.max(0, Number(el.querySelector("#fLow").value) || 0),
+          on_list: el.querySelector("#fList").checked,
+          notes: el.querySelector("#fNotes").value.trim() || null
+        };
+        if (!row.name) return toast("Give it a name.");
+        const res = isNew
+          ? await sb.from("inventory_items").insert(row).select().single()
+          : await sb.from("inventory_items").update(row).eq("id", it.id).select().single();
+        if (res.error) return toast(friendlyError(res.error));
+        if (isNew) S.items.push(res.data); else Object.assign(it, res.data);
+        S.items.sort((a, b) => a.name.localeCompare(b.name));
+        close(); render(); toast("Saved");
+      };
+      const del = el.querySelector("#del");
+      if (del) del.onclick = async () => {
+        if (!confirm(`Delete ${it.name}?`)) return;
+        const { error } = await sb.from("inventory_items").delete().eq("id", it.id);
+        if (error) return toast(friendlyError(error));
+        S.items = S.items.filter((x) => x.id !== it.id);
+        close(); render(); toast("Deleted");
+      };
+    });
+  }
+
+  // ---------- buy soon ----------
+  function viewBuy() {
+    const list = S.items.filter(needsBuying).sort((a, b) => a.category.localeCompare(b.category) || a.name.localeCompare(b.name));
+    view().innerHTML = `
+      <h1>Buy Soon</h1>
+      <p class="sub">Items running low, or added by hand.</p>
+      ${list.length ? `
+        <button class="btn light full" id="share">Send list</button>
+        <div style="height:12px"></div>
+        <div class="list">${list.map((i) => `
+          <div class="item">
+            <div class="grow">
+              <div class="name">${esc(i.name)}</div>
+              <div class="meta">Have ${num(i.qty)}${i.unit ? " " + esc(i.unit) : ""}${Number(i.low_at) > 0 ? ` · low at ${num(i.low_at)}` : ""}</div>
+            </div>
+            <button class="btn sm" data-bought="${i.id}">Bought</button>
+          </div>`).join("")}</div>`
+        : `<div class="empty">Nothing to buy right now.</div>`}`;
+
+    const share = view().querySelector("#share");
+    if (share) share.onclick = async () => {
+      const text = "Didi's Dogs – buy soon:\n" + list.map((i) => `• ${i.name}${i.unit ? ` (${i.unit})` : ""}`).join("\n");
+      try {
+        if (navigator.share) await navigator.share({ text });
+        else { await navigator.clipboard.writeText(text); toast("List copied"); }
+      } catch (e) { /* closed share sheet */ }
+    };
+    view().querySelectorAll("[data-bought]").forEach((b) => (b.onclick = () => bought(S.items.find((i) => i.id == b.dataset.bought))));
+  }
+
+  function bought(it) {
+    sheet(`
+      <h3>Bought ${esc(it.name)}</h3>
+      <p class="muted">How many did you get? This gets added to the ${num(it.qty)} you have.</p>
+      <label>Amount bought${it.unit ? ` (${esc(it.unit)})` : ""}</label>
+      <input id="amt" type="number" inputmode="decimal" min="0" step="any" placeholder="0">
+      <div class="actions"><button class="btn light" id="cancel">Cancel</button><button class="btn" id="ok">Save</button></div>`,
+    (el, close) => {
+      el.querySelector("#amt").focus();
+      el.querySelector("#cancel").onclick = close;
+      el.querySelector("#ok").onclick = async () => {
+        const add = Math.max(0, Number(el.querySelector("#amt").value) || 0);
+        const row = { qty: Number(it.qty) + add, on_list: false };
+        const { data, error } = await sb.from("inventory_items").update(row).eq("id", it.id).select().single();
+        if (error) return toast(friendlyError(error));
+        Object.assign(it, data);
+        close(); render();
+        toast(isLow(it) ? `Saved. Still low (${num(it.qty)}).` : "Saved");
+      };
+    });
+  }
+
+  // ---------- hours ----------
+  function viewHours() {
+    const workers = S.people.filter((p) => p.role === "crew" || p.role === "admin");
+    const unpaid = S.shifts.filter((s) => !s.paid);
+    const byWorker = {};
+    unpaid.forEach((s) => {
+      const w = (byWorker[s.worker_id] = byWorker[s.worker_id] || { hours: 0, owed: 0, count: 0 });
+      w.hours += Number(s.hours); w.owed += Number(s.hours) * Number(s.rate); w.count++;
+    });
+    const totalOwed = Object.values(byWorker).reduce((a, w) => a + w.owed, 0);
+    const shown = S.hoursFilter === "unpaid" ? unpaid : S.shifts;
+
+    view().innerHTML = `
+      <h1>Hours</h1>
+      <p class="sub">Workers log hours on the crew page. You can add or fix them here.</p>
+      <div class="card">
+        <div class="muted">Owed to workers</div>
+        <div class="big">${money(totalOwed)}</div>
+        <div class="muted small">${num(unpaid.reduce((a, s) => a + Number(s.hours), 0))} unpaid hours</div>
+      </div>
+      ${Object.keys(byWorker).length ? `<div class="list">${Object.entries(byWorker).map(([id, w]) => `
+        <div class="item">
+          <div class="grow"><div class="name">${esc(personName(id))}</div>
+            <div class="meta">${num(w.hours)} hrs · ${w.count} shift${w.count === 1 ? "" : "s"}</div></div>
+          <div style="text-align:right"><div class="name">${money(w.owed)}</div>
+            <button class="link" style="color:var(--ok);font-weight:600;padding:4px 0" data-pay="${id}">Mark paid</button></div>
+        </div>`).join("")}</div>` : ""}
+      <h2>Shifts</h2>
+      <div class="chips">
+        <button class="chip ${S.hoursFilter === "unpaid" ? "on" : ""}" data-hf="unpaid">Unpaid</button>
+        <button class="chip ${S.hoursFilter === "all" ? "on" : ""}" data-hf="all">All</button>
+      </div>
+      ${shown.length ? `<div class="list">${shown.map((s) => `
+        <button class="item tap" style="width:100%" data-shift="${s.id}">
+          <div class="grow">
+            <div class="name">${esc(personName(s.worker_id))}</div>
+            <div class="meta">${fmtDate(s.work_date)} · ${fmtTime(s.start_time)}–${fmtTime(s.end_time)}${s.note ? " · " + esc(s.note) : ""}</div>
+          </div>
+          <div style="text-align:right">
+            <div class="name">${num(s.hours)} h</div>
+            ${s.paid ? `<span class="tag paid">Paid</span>` : `<span class="muted small">${money(s.hours * s.rate)}</span>`}
+          </div>
+        </button>`).join("")}</div>` : `<div class="empty">No ${S.hoursFilter === "unpaid" ? "unpaid " : ""}shifts.</div>`}
+      ${workers.length ? `<button class="btn fab" id="addShift">+ Add hours</button>` : ""}`;
+
+    view().querySelectorAll("[data-hf]").forEach((b) => (b.onclick = () => { S.hoursFilter = b.dataset.hf; viewHours(); }));
+    view().querySelectorAll("[data-shift]").forEach((b) => (b.onclick = () => editShift(S.shifts.find((s) => s.id == b.dataset.shift))));
+    view().querySelectorAll("[data-pay]").forEach((b) => (b.onclick = () => payWorker(b.dataset.pay, byWorker[b.dataset.pay])));
+    const add = view().querySelector("#addShift");
+    if (add) add.onclick = () => editShift(null);
+  }
+
+  async function payWorker(id, w) {
+    if (!confirm(`Mark ${personName(id)} paid ${money(w.owed)} for ${num(w.hours)} hours?`)) return;
+    const ids = S.shifts.filter((s) => s.worker_id === id && !s.paid).map((s) => s.id);
+    const { data, error } = await sb.from("shifts").update({ paid: true }).in("id", ids).select();
+    if (error) return toast(friendlyError(error));
+    data.forEach((d) => Object.assign(S.shifts.find((s) => s.id === d.id), d));
+    render(); toast("Marked paid");
+  }
+
+  function editShift(s) {
+    const isNew = !s;
+    const workers = S.people.filter((p) => p.role === "crew" || p.role === "admin");
+    s = s || { worker_id: workers[0] && workers[0].id, work_date: today(), start_time: "", end_time: "", note: "", paid: false, rate: 0 };
+    const t = (v) => (v || "").slice(0, 5);
+    sheet(`
+      <h3>${isNew ? "Add hours" : "Edit shift"}</h3>
+      <label>Worker</label>
+      <select id="sW" ${isNew ? "" : "disabled"}>${(isNew ? workers : S.people).map((p) => `<option value="${p.id}" ${p.id === s.worker_id ? "selected" : ""}>${esc(p.name)}</option>`).join("")}</select>
+      <label>Date</label><input id="sD" type="date" value="${s.work_date}">
+      <div class="row">
+        <div class="grow"><label>Start</label><input id="sS" type="time" value="${t(s.start_time)}"></div>
+        <div class="grow"><label>End</label><input id="sE" type="time" value="${t(s.end_time)}"></div>
+      </div>
+      <p class="muted small" id="sH" style="margin:8px 0 0"></p>
+      <label>Event / note</label><input id="sN" value="${esc(s.note || "")}" placeholder="e.g. Cohen wedding">
+      ${isNew ? "" : `<div class="switch"><span>Paid</span><input id="sP" type="checkbox" ${s.paid ? "checked" : ""}></div>
+        <p class="muted small" style="margin:0">Rate on this shift: ${money(s.rate)}/hr</p>`}
+      <div class="actions">
+        ${isNew ? "" : `<button class="btn danger" id="del">Delete</button>`}
+        <button class="btn" id="save">Save</button>
+      </div>`, (el, close) => {
+      const upd = () => {
+        const h = calcHours(el.querySelector("#sS").value, el.querySelector("#sE").value);
+        el.querySelector("#sH").textContent = h ? `${num(h)} hours` : "";
+      };
+      el.querySelector("#sS").oninput = upd; el.querySelector("#sE").oninput = upd; upd();
+      el.querySelector("#save").onclick = async () => {
+        const row = {
+          work_date: el.querySelector("#sD").value,
+          start_time: el.querySelector("#sS").value,
+          end_time: el.querySelector("#sE").value,
+          note: el.querySelector("#sN").value.trim() || null
+        };
+        if (!row.work_date || !row.start_time || !row.end_time) return toast("Add the date, start and end.");
+        if (row.start_time === row.end_time) return toast("Start and end can't be the same.");
+        if (isNew) row.worker_id = el.querySelector("#sW").value;
+        else row.paid = el.querySelector("#sP").checked;
+        const res = isNew
+          ? await sb.from("shifts").insert(row).select().single()
+          : await sb.from("shifts").update(row).eq("id", s.id).select().single();
+        if (res.error) return toast(friendlyError(res.error));
+        if (isNew) S.shifts.unshift(res.data); else Object.assign(s, res.data);
+        S.shifts.sort((a, b) => b.work_date.localeCompare(a.work_date) || b.start_time.localeCompare(a.start_time));
+        close(); render(); toast("Saved");
+      };
+      const del = el.querySelector("#del");
+      if (del) del.onclick = async () => {
+        if (!confirm("Delete this shift?")) return;
+        const { error } = await sb.from("shifts").delete().eq("id", s.id);
+        if (error) return toast(friendlyError(error));
+        S.shifts = S.shifts.filter((x) => x.id !== s.id);
+        close(); render(); toast("Deleted");
+      };
+    });
+  }
+
+  // ---------- workers ----------
+  function viewTeam() {
+    const pending = S.people.filter((p) => p.role === "pending");
+    const active = S.people.filter((p) => p.role === "crew" || p.role === "admin");
+    const removed = S.people.filter((p) => p.role === "removed");
+    const roleTag = (r) => r === "admin" ? `<span class="tag plain">Owner</span>` : r === "removed" ? `<span class="tag plain">Removed</span>` : "";
+
+    view().innerHTML = `
+      <h1>Workers</h1>
+      <p class="sub">Workers sign up on the crew page, then you approve them here.</p>
+      <div class="card">
+        <div class="muted small">Crew page link</div>
+        <div style="word-break:break-all;margin:4px 0 12px">${esc(crewLink())}</div>
+        <button class="btn light sm" id="shareCrew">Send to a worker</button>
+      </div>
+      ${pending.length ? `<h2>Waiting for approval</h2><div class="list">${pending.map((p) => `
+        <div class="item" style="flex-wrap:wrap">
+          <div class="grow"><div class="name">${esc(p.name)}</div><div class="meta">${esc(p.email || "")}</div></div>
+          <div class="row"><button class="btn danger sm" data-role="removed" data-id="${p.id}">Remove</button>
+          <button class="btn sm" data-role="crew" data-id="${p.id}">Approve</button></div>
+        </div>`).join("")}</div>` : ""}
+      <h2>Team</h2>
+      ${active.length ? `<div class="list">${active.map((p) => `
+        <button class="item tap" style="width:100%" data-person="${p.id}">
+          <div class="grow"><div class="name">${esc(p.name)} ${roleTag(p.role)}</div>
+            <div class="meta">${esc(p.phone || p.email || "")}</div></div>
+          <div class="muted">${Number(p.pay_rate) ? money(p.pay_rate) + "/hr" : "No rate"}</div>
+        </button>`).join("")}</div>` : `<div class="empty">No workers yet.</div>`}
+      ${removed.length ? `<h2>Removed</h2><div class="list">${removed.map((p) => `
+        <button class="item tap" style="width:100%" data-person="${p.id}">
+          <div class="grow"><div class="name">${esc(p.name)}</div><div class="meta">${esc(p.email || "")}</div></div>
+        </button>`).join("")}</div>` : ""}`;
+
+    view().querySelector("#shareCrew").onclick = async () => {
+      const text = `Didi's Dogs crew page. Make an account and log your hours here: ${crewLink()}`;
+      try {
+        if (navigator.share) await navigator.share({ text });
+        else { await navigator.clipboard.writeText(text); toast("Link copied"); }
+      } catch (e) {}
+    };
+    view().querySelectorAll("[data-role]").forEach((b) => (b.onclick = async () => {
+      const p = S.people.find((x) => x.id === b.dataset.id);
+      if (b.dataset.role === "removed" && !confirm(`Remove ${p.name}?`)) return;
+      await savePerson(p, { role: b.dataset.role });
+      if (b.dataset.role === "crew") editPerson(p);
+    }));
+    view().querySelectorAll("[data-person]").forEach((b) => (b.onclick = () => editPerson(S.people.find((x) => x.id === b.dataset.person))));
+  }
+
+  async function savePerson(p, row) {
+    const { data, error } = await sb.from("profiles").update(row).eq("id", p.id).select().single();
+    if (error) { toast(friendlyError(error)); return false; }
+    Object.assign(p, data);
+    render(); toast("Saved");
+    return true;
+  }
+
+  function editPerson(p) {
+    const self = p.id === S.me.id;
+    sheet(`
+      <h3>${esc(p.name)}</h3>
+      <p class="muted" style="margin:0">${esc(p.email || "")}</p>
+      <label>Name</label><input id="pN" value="${esc(p.name)}">
+      <label>Phone</label><input id="pPh" type="tel" value="${esc(p.phone || "")}">
+      <label>Pay per hour ($)</label><input id="pR" type="number" inputmode="decimal" min="0" step="0.01" value="${num(p.pay_rate)}">
+      <p class="muted small" style="margin:6px 0 0">New shifts use this rate. Shifts already logged keep their rate.</p>
+      <label>Access</label>
+      <select id="pRole">
+        <option value="crew" ${p.role === "crew" ? "selected" : ""}>Worker (logs hours only)</option>
+        <option value="admin" ${p.role === "admin" ? "selected" : ""}>Owner (sees everything)</option>
+        ${self ? "" : `<option value="removed" ${p.role === "removed" ? "selected" : ""}>Removed (no access)</option>`}
+      </select>
+      <div class="actions"><button class="btn light" id="cancel">Cancel</button><button class="btn" id="save">Save</button></div>`,
+    (el, close) => {
+      el.querySelector("#cancel").onclick = close;
+      el.querySelector("#save").onclick = async () => {
+        const row = {
+          name: el.querySelector("#pN").value.trim() || p.name,
+          phone: el.querySelector("#pPh").value.trim() || null,
+          pay_rate: Math.max(0, Number(el.querySelector("#pR").value) || 0),
+          role: el.querySelector("#pRole").value
+        };
+        if (await savePerson(p, row)) close();
+      };
+    });
+  }
+
+  start();
+})();
+</script>
+</body>
+</html>

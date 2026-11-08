@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#ffffff">
+<meta name="robots" content="noindex">
+<title>Didi's Dogs Crew</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body style="padding-bottom:24px">
+<div id="app"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="config.js"></script>
+<script src="common.js"></script>
+<script>
+(() => {
+  const { sb, esc, money, num, today, fmtDate, fmtTime, calcHours, toast, sheet, friendlyError } = DD;
+  const app = document.getElementById("app");
+  let me = null, shifts = [];
+
+  async function start() {
+    if (!DD.ready) return DD.notConnected(app);
+    const { data: { session } } = await sb.auth.getSession();
+    if (!session) {
+      return DD.authScreen(app, { title: "Crew", note: "Sign in to log your hours. New? Create an account, then wait for approval.", onDone: start });
+    }
+    try { me = await DD.loadMe(); } catch (e) { return toast(friendlyError(e)); }
+    if (!me || me.role === "pending" || me.role === "removed") return waiting();
+    const { data, error } = await sb.from("shifts").select("*").eq("worker_id", me.id)
+      .order("work_date", { ascending: false }).order("start_time", { ascending: false });
+    if (error) toast(friendlyError(error));
+    shifts = data || [];
+    render();
+  }
+
+  async function signOut() { await sb.auth.signOut(); start(); }
+
+  function header() {
+    return `<header class="top"><div class="wrap">
+      <div class="brand">Didi's Dogs<small>Crew${me ? " · " + esc(me.name) : ""}</small></div>
+      <button class="link" id="out">Sign out</button></div></header>`;
+  }
+
+  function waiting() {
+    const removed = me && me.role === "removed";
+    app.innerHTML = `${header()}<main class="wrap"><div class="center-box" style="margin-top:32px;padding:0">
+      <h1>${removed ? "No access" : "Almost there"}</h1>
+      <p class="sub">${removed ? "This account isn't active. Talk to the owner if that's a mistake." : "Your account is waiting for the owner to approve it. Check back after they do."}</p>
+      ${removed ? "" : `<button class="btn full" id="again">Check again</button>`}</div></main>`;
+    app.querySelector("#out").onclick = signOut;
+    const again = app.querySelector("#again");
+    if (again) again.onclick = start;
+  }
+
+  function render() {
+    const unpaid = shifts.filter((s) => !s.paid);
+    const hrs = unpaid.reduce((a, s) => a + Number(s.hours), 0);
+    const owed = unpaid.reduce((a, s) => a + Number(s.hours) * Number(s.rate), 0);
+    app.innerHTML = `${header()}<main class="wrap">
+      <h1>Log hours</h1>
+      <p class="sub">Add each shift you work.</p>
+      <div class="card">
+        <label style="margin-top:0">Date</label><input id="d" type="date" value="${today()}">
+        <div class="row">
+          <div class="grow"><label>Start</label><input id="s" type="time"></div>
+          <div class="grow"><label>End</label><input id="e" type="time"></div>
+        </div>
+        <p class="muted small" id="h" style="margin:8px 0 0"></p>
+        <label>Event / note (optional)</label><input id="n" placeholder="e.g. Cohen wedding">
+        <div style="height:16px"></div>
+        <button class="btn full" id="save">Save hours</button>
+      </div>
+
+      <h2>Not paid yet</h2>
+      <div class="card">
+        <div class="big">${num(hrs)} hrs</div>
+        ${owed > 0 ? `<div class="muted">${money(owed)}</div>` : ""}
+      </div>
+
+      <h2>My shifts</h2>
+      ${shifts.length ? `<div class="list">${shifts.map((s) => `
+        <button class="item tap" style="width:100%" data-id="${s.id}" ${s.paid ? "disabled" : ""}>
+          <div class="grow">
+            <div class="name">${fmtDate(s.work_date)}</div>
+            <div class="meta">${fmtTime(s.start_time)}–${fmtTime(s.end_time)}${s.note ? " · " + esc(s.note) : ""}</div>
+          </div>
+          <div style="text-align:right"><div class="name">${num(s.hours)} h</div>
+            ${s.paid ? `<span class="tag paid">Paid</span>` : `<span class="muted small">Tap to fix</span>`}</div>
+        </button>`).join("")}</div>` : `<div class="empty">No shifts yet.</div>`}
+    </main>`;
+
+    app.querySelector("#out").onclick = signOut;
+    const upd = () => {
+      const h = calcHours(app.querySelector("#s").value, app.querySelector("#e").value);
+      app.querySelector("#h").textContent = h ? `${num(h)} hours` : "";
+    };
+    app.querySelector("#s").oninput = upd; app.querySelector("#e").oninput = upd;
+    app.querySelector("#save").onclick = async (ev) => {
+      const row = {
+        work_date: app.querySelector("#d").value,
+        start_time: app.querySelector("#s").value,
+        end_time: app.querySelector("#e").value,
+        note: app.querySelector("#n").value.trim() || null
+      };
+      if (!row.work_date || !row.start_time || !row.end_time) return toast("Add the date, start and end.");
+      if (row.start_time === row.end_time) return toast("Start and end can't be the same.");
+      ev.target.disabled = true;
+      const { data, error } = await sb.from("shifts").insert(row).select().single();
+      if (error) { ev.target.disabled = false; return toast(friendlyError(error)); }
+      shifts.unshift(data);
+      shifts.sort((a, b) => b.work_date.localeCompare(a.work_date) || b.start_time.localeCompare(a.start_time));
+      render(); toast(`Saved ${num(data.hours)} hours`);
+    };
+    app.querySelectorAll("[data-id]").forEach((b) => (b.onclick = () => fix(shifts.find((s) => s.id == b.dataset.id))));
+  }
+
+  function fix(s) {
+    const t = (v) => (v || "").slice(0, 5);
+    sheet(`
+      <h3>Fix shift</h3>
+      <label>Date</label><input id="fd" type="date" value="${s.work_date}">
+      <div class="row">
+        <div class="grow"><label>Start</label><input id="fs" type="time" value="${t(s.start_time)}"></div>
+        <div class="grow"><label>End</label><input id="fe" type="time" value="${t(s.end_time)}"></div>
+      </div>
+      <label>Event / note</label><input id="fn" value="${esc(s.note || "")}">
+      <div class="actions"><button class="btn danger" id="del">Delete</button><button class="btn" id="ok">Save</button></div>`,
+    (el, close) => {
+      el.querySelector("#ok").onclick = async () => {
+        const row = { work_date: el.querySelector("#fd").value, start_time: el.querySelector("#fs").value,
+          end_time: el.querySelector("#fe").value, note: el.querySelector("#fn").value.trim() || null };
+        if (!row.work_date || !row.start_time || !row.end_time) return toast("Add the date, start and end.");
+        if (row.start_time === row.end_time) return toast("Start and end can't be the same.");
+        const { data, error } = await sb.from("shifts").update(row).eq("id", s.id).select().single();
+        if (error) return toast(friendlyError(error));
+        Object.assign(s, data); close(); render(); toast("Saved");
+      };
+      el.querySelector("#del").onclick = async () => {
+        if (!confirm("Delete this shift?")) return;
+        const { error } = await sb.from("shifts").delete().eq("id", s.id);
+        if (error) return toast(friendlyError(error));
+        shifts = shifts.filter((x) => x.id !== s.id); close(); render(); toast("Deleted");
+      };
+    });
+  }
+
+  start();
+})();
+</script>
+</body>
+</html>
